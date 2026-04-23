@@ -60,8 +60,12 @@ def split_gherkin_steps(gherkin: str) -> List[str]:
     return steps
 
 def get_client(api_key: str):
-    # Timeout de 120s para evitar erro 504
-    return openai.OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1", http_client=httpx.Client(timeout=120.0))
+    # Aumentamos o timeout global para 180 segundos para dar margem total
+    return openai.OpenAI(
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
+        http_client=httpx.Client(timeout=180.0)
+    )
 
 def extract_frames_from_video(video_bytes: bytes, num_frames: int = 3) -> List[bytes]:
     frames = []
@@ -95,34 +99,34 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
     images_payload = []
     processed_evidence = []
 
-    # 1. Processamento e Otimização de Imagens
+    # Reduzimos para 2 frames por vídeo para ser mais rápido
     for f in files:
         file_bytes_list = []
         if f['type'].startswith('image/'):
             file_bytes_list = [f['bytes']]
         elif f['type'].startswith('video/'):
-            file_bytes_list = extract_frames_from_video(f['bytes'], num_frames=3)
+            file_bytes_list = extract_frames_from_video(f['bytes'], num_frames=2)
 
         for b in file_bytes_list:
             try:
                 img = PILImage.open(io.BytesIO(b))
                 if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                img.thumbnail((800, 800)) # Redução de resolução para evitar timeout
+
+                # OTIMIZAÇÃO CRÍTICA: 600px é o ponto ideal entre peso e visão da IA
+                img.thumbnail((600, 600))
                 buffered = io.BytesIO()
-                img.save(buffered, format="JPEG", quality=70) # Compressão
+                img.save(buffered, format="JPEG", quality=65) # Qualidade 65% para garantir fluidez
+
                 final_bytes = buffered.getvalue()
                 processed_evidence.append(final_bytes)
                 b64 = base64.b64encode(final_bytes).decode('utf-8')
                 images_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
             except: continue
 
-    # 2. Chamada em Lote (Batching) - Analisa todos os passos em uma única requisição
     steps_list_str = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
     prompt_texto = (
-        f"Cenário: {name}\n"
-        f"Analise os seguintes passos de teste e verifique as evidências visuais enviadas:\n{steps_list_str}\n\n"
-        "Retorne EXCLUSIVAMENTE um objeto JSON no seguinte formato, sem explicações:\n"
-        "{\"analises\": [{\"status\": \"PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA\", \"justificativa\": \"...\"}]}"
+        f"Analise objetivamente se as imagens comprovam estes passos:\n{steps_list_str}\n\n"
+        "Responda APENAS um JSON: {\"analises\": [{\"status\": \"PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA\", \"justificativa\": \"...\"}]}"
     )
 
     content = [{"type": "text", "text": prompt_texto}]
@@ -130,16 +134,16 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
 
     try:
         response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-001",
+            # USANDO O MODELO LITE: Muito mais rápido contra erros 504
+            model="google/gemini-2.0-flash-lite-001",
             messages=[
-                {"role": "system", "content": "Você é um auditor de QA. Responda apenas com JSON válido."},
+                {"role": "system", "content": "Você é um auditor de QA rápido e preciso. Responda apenas JSON."},
                 {"role": "user", "content": content}
             ],
             response_format={"type": "json_object"},
-            timeout=100.0
+            timeout=150.0 # Timeout de chamada aumentado
         )
 
-        # Limpeza de resposta (JSON Fix)
         raw_content = response.choices[0].message.content.strip()
         if "```json" in raw_content:
             raw_content = raw_content.split("```json")[-1].split("```")[0].strip()
@@ -149,12 +153,11 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
 
         step_analyses = []
         for i, step in enumerate(steps):
-            # Garante que mapeia o resultado correto para cada passo
-            data = ai_analises[i] if i < len(ai_analises) else {"status": "ERRO", "justificativa": "Não analisado pela IA"}
+            data = ai_analises[i] if i < len(ai_analises) else {"status": "ERRO", "justificativa": "IA não processou por limite de tempo."}
             step_analyses.append({'step': step, **data})
 
     except Exception as e:
-        step_analyses = [{'step': s, 'status': 'ERRO', 'justificativa': f"Falha: {str(e)}"} for s in steps]
+        step_analyses = [{'step': s, 'status': 'ERRO', 'justificativa': f"Timeout ou Erro de Provedor: {str(e)}"} for s in steps]
 
     pass_count = sum(1 for s in step_analyses if s['status'] in ["PASSOU", "EVIDÊNCIA NÃO DISPONIBILIZADA"])
     return {
