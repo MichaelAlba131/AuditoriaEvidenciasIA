@@ -9,6 +9,7 @@ import tempfile
 import os
 import time
 import PyPDF2
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, KeepTogether
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -20,7 +21,6 @@ from typing import List, Dict, Any
 
 st.set_page_config(page_title="Auditoria de Qualidade GIC", layout="wide")
 
-# Configurações de Estilo e Cores
 PRIMARY_BLUE = colors.HexColor("#1F4E79")
 LIGHT_GRAY = colors.HexColor("#F2F2F2")
 BORDER_GRAY = colors.HexColor("#D9D9D9")
@@ -33,8 +33,6 @@ if 'metadata' not in st.session_state:
 if 'ct_list' not in st.session_state:
     st.session_state.ct_list = []
 
-# --- FUNÇÕES DE UTILITÁRIO ---
-
 def extrair_texto_arquivo(uploaded_file):
     texto = ""
     try:
@@ -45,142 +43,160 @@ def extrair_texto_arquivo(uploaded_file):
         elif uploaded_file.type == "text/plain":
             texto = uploaded_file.read().decode("utf-8")
     except Exception as e:
-        st.error(f"Erro ao ler ficheiro: {e}")
+        st.error(f"erro ao ler ficheiro: {e}")
     return texto
 
 def get_client(api_key: str):
     return openai.OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1", http_client=httpx.Client())
 
-def extract_frames_from_video(video_bytes: bytes, num_frames: int = 8) -> List[bytes]:
+@st.cache_data
+def extract_frames_from_video(video_bytes: bytes, num_frames: int = 5) -> List[bytes]:
     frames = []
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
-    cap = cv2.VideoCapture(tmp_path)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames > 0:
-        interval = max(1, total_frames // num_frames)
-        for i in range(num_frames):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, i * interval)
-            ret, frame = cap.read()
-            if ret:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                pil_img = PILImage.fromarray(frame_rgb)
-                buffer = io.BytesIO()
-                pil_img.save(buffer, format="JPEG", quality=85)
-                frames.append(buffer.getvalue())
-    cap.release()
-    if os.path.exists(tmp_path): os.unlink(tmp_path)
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames > 0:
+            interval = max(1, total_frames // num_frames)
+            for i in range(num_frames):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, i * interval)
+                ret, frame = cap.read()
+                if ret:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    pil_img = PILImage.fromarray(frame_rgb)
+                    buffer = io.BytesIO()
+                    pil_img.save(buffer, format="JPEG", quality=65)
+                    frames.append(buffer.getvalue())
+        cap.release()
+    finally:
+        if os.path.exists(tmp_path): os.unlink(tmp_path)
     return frames
 
-# --- FUNÇÕES DE INTELIGÊNCIA ARTIFICIAL ---
+def compress_image_for_api(image_bytes: bytes, max_size: int = 768, quality: int = 65) -> str:
+    try:
+        img = PILImage.open(io.BytesIO(image_bytes))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.thumbnail((max_size, max_size))
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG", quality=quality)
+        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+    except:
+        return None
 
-def analyze_all_cts_at_once(ct_list: List[Dict], api_key: str) -> List[Dict]:
+def analyze_single_ct(ct: Dict, api_key: str, progress_placeholder=None) -> Dict:
     client = get_client(api_key)
-    all_results = []
+    scenarios_context = f"--- ID: {ct['id']} | NOME: {ct['name']} ---\nPASSOS:\n{ct['gherkin']}\n"
+    images_payload = []
+    processed_images = []
 
-    for ct in ct_list:
-        scenarios_context = f"--- ID: {ct['id']} | NOME: {ct['name']} ---\nPASSOS:\n{ct['gherkin']}\n"
-        images_payload = []
+    for f in ct.get('up_files', []):
+        try:
+            file_bytes_list = extract_frames_from_video(f.getvalue(), num_frames=5) if f.type.startswith('video/') else [f.getvalue()]
 
-        for f in ct.get('up_files', []):
-            try:
-                # MODO EXTREMO DE POUPANÇA: Apenas 3 frames por vídeo
-                file_bytes_list = extract_frames_from_video(f.getvalue(), num_frames=3) if f.type.startswith('video/') else [f.getvalue()]
-
-                for b in file_bytes_list:
-                    img = PILImage.open(io.BytesIO(b))
-                    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-
-                    # Redução drástica de resolução e qualidade para evitar o 429
-                    img.thumbnail((768, 768))
-                    buffered = io.BytesIO()
-                    img.save(buffered, format="JPEG", quality=60)
-                    b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            for b in file_bytes_list:
+                b64 = compress_image_for_api(b, max_size=768, quality=65)
+                if b64:
                     images_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-            except Exception as e:
-                print(f"Erro ao processar imagem para IA: {e}")
-                continue
+                    processed_images.append(b)
+        except Exception:
+            continue
 
-        prompt = f"""Atue como um QA. Analise o Cenário abaixo contra as evidências (imagens em anexo).
+    prompt = f"""Atue como um Especialista em Auditoria de QA.
+        Analise o Cenário de Teste abaixo e valide cada passo usando EXCLUSIVAMENTE as imagens enviadas em anexo.
 
         CENÁRIO:
         {scenarios_context}
 
-        REQUISITOS:
-        1. Compare as imagens em anexo para validar os passos.
-        2. Retorne APENAS o JSON:
+        INSTRUÇÕES DE ANÁLISE:
+        1. As imagens em anexo SÃO as evidências. Observe detalhes como títulos de janelas, estados de botões e dados em tabelas.
+        2. Para validar se um botão 'funcionou', procure por mudanças sutis na interface entre uma imagem e outra.
+        3. Seja específico na justificativa: mencione o que viu na imagem que prova o resultado.
+
+        SAÍDA OBRIGATÓRIA (JSON):
         {{
           "ct_id": "{ct['id']}",
           "steps_analysis": [
-            {{"step": "Passo", "status": "PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA", "justificativa": "Análise visual detalhada."}}
+            {{"step": "Texto do passo", "status": "PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA", "justificativa": "Descrição técnica."}}
           ]
         }}"""
 
-        content = [{"type": "text", "text": prompt}] + images_payload
+    content = [{"type": "text", "text": prompt}] + images_payload
+    max_retries = 3
+    result = None
 
-        max_retries = 3
-        success = False
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="google/gemini-2.0-flash-001",
+                messages=[{"role": "user", "content": content}],
+                response_format={"type": "json_object"},
+                timeout=120.0
+            )
+            data = json.loads(response.choices[0].message.content)
+            result = data.get("results", data) if isinstance(data, dict) else data
 
-        for attempt in range(max_retries):
-            try:
-                response = client.chat.completions.create(
-                    model="google/gemini-2.0-flash-001",
-                    messages=[{"role": "user", "content": content}],
-                    response_format={"type": "json_object"},
-                    timeout=120.0
-                )
-                data = json.loads(response.choices[0].message.content)
-                result = data.get("results", data) if isinstance(data, dict) else data
+            if isinstance(result, list) and len(result) > 0:
+                result = result[0]
 
-                if isinstance(result, list) and len(result) > 0:
-                    all_results.append(result[0])
-                else:
-                    all_results.append(result)
-
-                success = True
+            result['_processed_images'] = processed_images
+            break
+        except Exception as e:
+            error_str = str(e)
+            if any(code in error_str for code in ["429", "504", "502"]) and attempt < max_retries - 1:
+                time.sleep((attempt + 1) * 3)
+            else:
+                result = {
+                    "ct_id": ct['id'],
+                    "steps_analysis": [{"step": "falha técnica", "status": "ERRO", "justificativa": f"erro na api: {error_str[:100]}"}],
+                    "_processed_images": processed_images
+                }
                 break
-            except Exception as e:
-                error_str = str(e)
-                if any(code in error_str for code in ["429", "504", "502"]) and attempt < max_retries - 1:
-                    # Esperas muito mais longas: 30s, 60s, 90s
-                    wait_time = (attempt + 1) * 30
-                    st.warning(f"O Provedor da IA bloqueou por excesso de carga. Tentativa {attempt+1}/{max_retries} em {wait_time}s...")
-                    time.sleep(wait_time)
-                else:
-                    st.error(f"Erro ao analisar o {ct['id']}:\n{error_str}")
-                    break
 
-        if not success:
-            all_results.append({
-                "ct_id": ct['id'],
-                "steps_analysis": [{"step": "Geral", "status": "ERRO", "justificativa": "O servidor da IA rejeitou a análise por limites técnicos de processamento."}]
-            })
+    if not result:
+        result = {
+            "ct_id": ct['id'],
+            "steps_analysis": [{"step": "falha técnica", "status": "ERRO", "justificativa": "timeout no cenário."}],
+            "_processed_images": processed_images
+        }
 
+    return result
+
+def analyze_all_cts_at_once(ct_list: List[Dict], api_key: str) -> List[Dict]:
+    all_results = []
+    max_workers = min(3, len(ct_list))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(analyze_single_ct, ct, api_key): ct['id'] for ct in ct_list}
+
+        for future in as_completed(futures):
+            try:
+                all_results.append(future.result(timeout=180))
+            except Exception:
+                ct_id = futures[future]
+                all_results.append({
+                    "ct_id": ct_id,
+                    "steps_analysis": [{"step": "falha técnica", "status": "ERRO", "justificativa": "erro de processamento paralelo."}],
+                    "_processed_images": []
+                })
     return all_results
 
 def generate_business_summary(results: List[Dict], metadata: Dict, api_key: str) -> str:
     client = get_client(api_key)
-    jira_context = metadata.get('jira_full_text', 'Não informado')
+    jira_context = metadata.get('jira_full_text', 'não informado')
 
     contexto_testes = f"Teste: {metadata.get('teste_nome')}\n"
     for res in results:
-        contexto_testes += f"Cenário: {res['name']} - Status: {res['pass_count']}/{res['total_steps']} validados.\n"
+        contexto_testes += f"Cenário: {res.get('name', 'N/A')} - Sucesso: {res.get('pass_count', 0)}/{res.get('total_steps', 0)}\n"
 
-    prompt = f"""Atue como um Product Owner sênior.
-    Analise se os resultados dos testes abaixo condizem com os REQUISITOS DA HISTÓRIA fornecidos.
+    prompt = f"""Atue como Product Owner. Com base nos requisitos e nos resultados técnicos, escreva um Resumo de Negócio executivo (1 parágrafo).
+    REQUISITOS: {jira_context}
+    RESULTADOS: {contexto_testes}"""
 
-    REQUISITOS DA HISTÓRIA/ACEITE:
-    {jira_context}
-
-    RESULTADOS TÉCNICOS:
-    {contexto_testes}
-
-    Escreva um 'Resumo de Negócio' de 1 parágrafo focado no valor, conformidade com o requisito e segurança. Seja executivo."""
-
-    # Adicionado Retry para estabilidade do Resumo
-    max_retries = 3
-    for attempt in range(max_retries):
+    # adicionado o sistema de retry aqui também
+    for attempt in range(3):
         try:
             response = client.chat.completions.create(
                 model="google/gemini-2.0-flash-001",
@@ -188,14 +204,11 @@ def generate_business_summary(results: List[Dict], metadata: Dict, api_key: str)
                 timeout=60.0
             )
             return response.choices[0].message.content
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(5)
+        except Exception:
+            if attempt < 2:
+                time.sleep((attempt + 1) * 3)
             else:
-                st.error(f"Falha ao gerar o Resumo de Negócio: {e}")
-                return "Não foi possível gerar o resumo automático devido a uma falha de comunicação com a IA após múltiplas tentativas."
-
-# --- FUNÇÕES DE PDF ---
+                return "não foi possível gerar o resumo executivo automaticamente devido a instabilidades na ia."
 
 def add_footer(canvas, doc):
     canvas.saveState()
@@ -245,10 +258,10 @@ def generate_pdf(results: List[Dict], metadata: Dict, business_summary: str, log
     story.append(summary_table)
 
     for res in results:
-        story.append(Paragraph(f"Cenário {res.get('ct_id', '')}: {res['name']}", section_style))
+        story.append(Paragraph(f"Cenário {res.get('ct_id', '')}: {res.get('name', 'N/A')}", section_style))
         steps_data = [[Paragraph("<b>Passo Gherkin</b>", meta_style), Paragraph("<b>Status</b>", meta_style), Paragraph("<b>Justificativa IA</b>", meta_style)]]
 
-        for s in res['steps']:
+        for s in res.get('steps', []):
             color = PASS_GREEN if "PASSOU" in s['status'] else (WARN_ORANGE if "DISPONIBILIZADA" in s['status'] else FAIL_RED)
             steps_data.append([Paragraph(s['step'], meta_style), Paragraph(f"<b><font color={color}>{s['status']}</font></b>", meta_style), Paragraph(s['justificativa'], meta_style)])
 
@@ -256,126 +269,109 @@ def generate_pdf(results: List[Dict], metadata: Dict, business_summary: str, log
         t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), PRIMARY_BLUE), ('TEXTCOLOR', (0,0), (-1,0), colors.white), ('GRID', (0,0), (-1,-1), 0.5, colors.white), ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_GRAY]), ('VALIGN', (0,0), (-1,-1), 'TOP')]))
         story.append(t)
 
-        # Correção da renderização de Imagens no PDF
         if res.get('evidence_images'):
-            story.append(Spacer(1, 15))
-            story.append(Paragraph(f"<b>EVIDÊNCIAS VISUAIS - {res.get('ct_id', '')}:</b>", meta_style))
-            story.append(Spacer(1, 5))
-
+            story.append(Spacer(1, 10))
+            story.append(Paragraph(f"<b>EVIDÊNCIAS VISUAIS:</b>", meta_style))
             for img_bytes in res['evidence_images']:
                 try:
                     img_io = io.BytesIO(img_bytes)
-                    pil_img = PILImage.open(img_io)
-
-                    if pil_img.mode in ("RGBA", "P"):
-                        pil_img = pil_img.convert("RGB")
-
-                    # Força a criação de um buffer limpo em JPEG para o ReportLab ler sem erros
+                    pil_img = PILImage.open(img_io).convert("RGB")
                     clean_buf = io.BytesIO()
                     pil_img.save(clean_buf, format="JPEG")
-                    clean_buf.seek(0) # IMPORTANTÍSSIMO para o ReportLab não falhar
-
+                    clean_buf.seek(0)
                     w, h = pil_img.size
-                    max_width = 150 * mm
+                    max_width = 165 * mm
                     aspect = h / float(w)
-                    calc_height = max_width * aspect
-
-                    # Limita a altura para não quebrar a página
-                    if calc_height > 200 * mm:
-                        calc_height = 200 * mm
-                        max_width = calc_height / aspect
-
-                    story.append(KeepTogether([
-                        RLImage(clean_buf, width=max_width, height=calc_height),
-                        Spacer(1, 10)
-                    ]))
-                except Exception as e:
-                    print(f"Erro ao desenhar imagem no PDF: {e}")
-                    continue
-        else:
-            story.append(Spacer(1, 5))
-            story.append(Paragraph("<i>Nenhuma evidência visual anexada.</i>", meta_style))
+                    story.append(KeepTogether([Spacer(1, 5), RLImage(clean_buf, width=max_width, height=max_width * aspect), Spacer(1, 5)]))
+                except: continue
 
     doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
     return buffer.getvalue()
 
-# --- INTERFACE STREAMLIT ---
-
 st.sidebar.title("🛠️ Configurações")
 api_key = st.sidebar.text_input("OpenRouter API Key", type="password")
-logo_upload = st.sidebar.file_uploader("🖼️ Upload do Logo", type=["png", "jpg", "jpeg"])
+logo_upload = st.sidebar.file_uploader("🖼️ Logo da Empresa", type=["png", "jpg", "jpeg"])
 
 st.title("🧪 Auditoria de Qualidade Pro")
 
 with st.expander("📝 Cabeçalho do Documento", expanded=True):
     c1, c2 = st.columns(2)
-    st.session_state.metadata['teste_nome'] = c1.text_input("TESTE (Título)")
-    st.session_state.metadata['modulo'] = c1.text_input("MÓDULO")
-    st.session_state.metadata['historia'] = c1.text_input("HISTÓRIA")
-    st.session_state.metadata['pre_requisitos'] = c1.text_area("PRÉ REQUISITOS")
-    st.session_state.metadata['status'] = c2.selectbox("STATUS", ["Aprovada", "Reprovada", "Em Análise"])
-    st.session_state.metadata['sprint'] = c2.text_input("SPRINT")
-    st.session_state.metadata['versao'] = c2.text_input("VERSÃO")
-    st.session_state.metadata['automatizado'] = c2.radio("AUTOMATIZADO", ["Não", "Sim"], horizontal=True)
+    st.session_state.metadata['teste_nome'] = c1.text_input("Título do Teste")
+    st.session_state.metadata['modulo'] = c1.text_input("Módulo")
+    st.session_state.metadata['historia'] = c1.text_input("História/Ticket")
+    st.session_state.metadata['pre_requisitos'] = c1.text_area("Pré-requisitos")
+
+    # status manual inicial
+    status_manual = c2.selectbox("Status Final", ["Aprovada", "Reprovada", "Em Análise"])
+    st.session_state.metadata['status'] = status_manual
+
+    st.session_state.metadata['sprint'] = c2.text_input("Sprint")
+    st.session_state.metadata['versao'] = c2.text_input("Versão/Build")
+    st.session_state.metadata['automatizado'] = c2.radio("Automatizado?", ["Não", "Sim"], horizontal=True)
 
 with st.container(border=True):
-    st.subheader("📖 Detalhamento da História / Requisitos")
-    modo_jira = st.radio("Selecione a forma de entrada:", ["Escrever Descrição (Jira)", "Anexar Documento de Aceite"], horizontal=True)
-
-    if modo_jira == "Escrever Descrição (Jira)":
-        jira_desc = st.text_area("Descrição completa da História e Critérios de Aceitação:", height=200)
-        st.session_state.metadata['jira_full_text'] = jira_desc
+    st.subheader("📖 Requisitos da História")
+    modo_jira = st.radio("Entrada:", ["Texto Direto", "Upload de Arquivo"], horizontal=True)
+    if modo_jira == "Texto Direto":
+        st.session_state.metadata['jira_full_text'] = st.text_area("Descrição/Critérios de Aceite:", height=150)
     else:
-        jira_file = st.file_uploader("Faça o upload do PDF ou TXT com os requisitos:", type=["pdf", "txt"])
-        if jira_file:
-            st.session_state.metadata['jira_full_text'] = extrair_texto_arquivo(jira_file)
+        jira_file = st.file_uploader("Arquivo de requisitos:", type=["pdf", "txt"])
+        if jira_file: st.session_state.metadata['jira_full_text'] = extrair_texto_arquivo(jira_file)
 
-st.header("📋 Cenários de Teste")
-if st.button("➕ Adicionar CT"):
-    st.session_state.ct_list.append({"id": f"CT{len(st.session_state.ct_list)+1:02d}", "name": "", "gherkin": "", "files": []})
+st.header("📋 Cenários")
+if st.button("➕ Adicionar Cenário"):
+    st.session_state.ct_list.append({"id": f"CT{len(st.session_state.ct_list)+1:02d}", "name": "", "gherkin": "", "up_files": []})
 
 for i, ct in enumerate(st.session_state.ct_list):
     with st.container(border=True):
-        col_id, col_name = st.columns([1, 4])
-        ct['id'] = col_id.text_input("ID", value=ct['id'], key=f"id_{i}")
-        ct['name'] = col_name.text_input("Nome do Cenário", value=ct['name'], key=f"name_{i}")
-        ct['gherkin'] = st.text_area("Gherkin", value=ct['gherkin'], key=f"gh_{i}")
-        ct['up_files'] = st.file_uploader(f"Evidências {ct['id']}", accept_multiple_files=True, key=f"f_{i}", type=["png", "jpg", "jpeg", "mp4", "mov", "avi"])
+        col1, col2 = st.columns([1, 4])
+        ct['id'] = col1.text_input("ID", value=ct['id'], key=f"id_{i}")
+        ct['name'] = col2.text_input("Cenário", value=ct['name'], key=f"name_{i}")
+        ct['gherkin'] = st.text_area("Passos (Gherkin)", value=ct['gherkin'], key=f"gh_{i}")
+        ct['up_files'] = st.file_uploader(f"Anexar Provas ({ct['id']})", accept_multiple_files=True, key=f"f_{i}")
 
-if st.button("🚀 Gerar Auditoria Completa", type="primary"):
-    if not api_key: st.error("Insira a API Key.")
-    elif not st.session_state.ct_list: st.warning("Adicione pelo menos um cenário.")
+if st.button("🚀 Gerar Auditoria", type="primary"):
+    if not api_key: st.error("Falta a API Key.")
+    elif not st.session_state.ct_list: st.warning("Adicione cenários.")
     else:
-        with st.spinner("A IA está a analisar os cenários e evidências..."):
+        with st.spinner("analisando evidências..."):
             raw_results = analyze_all_cts_at_once(st.session_state.ct_list, api_key)
 
             final_results = []
+            results_map = {item.get('ct_id'): item for item in raw_results}
+
+            total_passos_gerais = 0
+            total_passos_sucesso = 0
+            tem_erro = False
+
             for ct in st.session_state.ct_list:
-                analysis_data = next((item for item in raw_results if item.get('ct_id') == ct['id']), None)
-                steps_formatted = analysis_data.get('steps_analysis', []) if analysis_data else []
+                analysis = results_map.get(ct['id'], {})
+                steps = analysis.get('steps_analysis', [])
+                images = analysis.get('_processed_images', [])
 
-                if not steps_formatted:
-                    steps_formatted = [{'step': 'N/A', 'status': 'ERRO', 'justificativa': 'Não processado.'}]
+                passos_sucesso_ct = sum(1 for s in steps if "PASSOU" in s.get('status', ''))
 
-                # Tratamento robótico de imagens para que o PDF nunca falhe
-                processed_images = []
-                for f in ct.get('up_files', []):
-                    try:
-                        if f.type.startswith('image/'):
-                            processed_images.append(f.getvalue())
-                        elif f.type.startswith('video/'):
-                            processed_images.extend(extract_frames_from_video(f.getvalue()))
-                    except: continue
+                # checa se a ia devolveu algum erro técnico ou falha
+                if any(s.get('status') in ["ERRO", "FALHOU", "EVIDÊNCIA NÃO DISPONIBILIZADA"] for s in steps):
+                    tem_erro = True
+
+                total_passos_gerais += len(steps)
+                total_passos_sucesso += passos_sucesso_ct
 
                 final_results.append({
-                    'ct_id': ct['id'], 'name': ct['name'], 'steps': steps_formatted,
-                    'pass_count': sum(1 for s in steps_formatted if "PASSOU" in s['status']),
-                    'total_steps': len(steps_formatted), 'evidence_images': processed_images
+                    'ct_id': ct['id'], 'name': ct['name'], 'steps': steps,
+                    'pass_count': passos_sucesso_ct,
+                    'total_steps': len(steps), 'evidence_images': images
                 })
 
-            summary = generate_business_summary(final_results, st.session_state.metadata, api_key)
-            logo_data = logo_upload.getvalue() if logo_upload else None
-            pdf = generate_pdf(final_results, st.session_state.metadata, summary, logo_data)
+            # sobrescreve o status manual com base na realidade técnica da ia
+            if tem_erro:
+                st.session_state.metadata['status'] = "Reprovada (Com Falhas/Erros)"
+            elif total_passos_sucesso == total_passos_gerais and total_passos_gerais > 0:
+                st.session_state.metadata['status'] = "Aprovada"
 
-            st.success("Auditoria Concluída!")
-            st.download_button("📥 Baixar PDF Premium", data=pdf, file_name="auditoria_qa_gic.pdf", mime="application/pdf")
+            sum_text = generate_business_summary(final_results, st.session_state.metadata, api_key)
+            pdf = generate_pdf(final_results, st.session_state.metadata, sum_text, logo_upload.getvalue() if logo_upload else None)
+
+            st.success("pronto!")
+            st.download_button("📥 Baixar PDF de Auditoria", data=pdf, file_name="auditoria_gic.pdf", mime="application/pdf")
