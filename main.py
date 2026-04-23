@@ -17,10 +17,9 @@ from reportlab.lib.units import mm
 from PIL import Image as PILImage
 from typing import List, Dict, Any
 
-# Configuração da Página
+# Configuração Inicial
 st.set_page_config(page_title="Auditoria de Qualidade GIC", layout="wide")
 
-# Cores e Estilos do PDF
 PRIMARY_BLUE = colors.HexColor("#1F4E79")
 LIGHT_GRAY = colors.HexColor("#F2F2F2")
 BORDER_GRAY = colors.HexColor("#D9D9D9")
@@ -28,13 +27,12 @@ PASS_GREEN = colors.HexColor("#2E7D32")
 FAIL_RED = colors.HexColor("#C62828")
 WARN_ORANGE = colors.HexColor("#EF6C00")
 
-# Inicialização do Estado
 if 'metadata' not in st.session_state:
     st.session_state.metadata = {}
 if 'ct_list' not in st.session_state:
     st.session_state.ct_list = []
 
-# --- FUNÇÕES UTILITÁRIAS ---
+# --- Funções de Suporte ---
 
 def extrair_texto_arquivo(uploaded_file):
     texto = ""
@@ -62,6 +60,7 @@ def split_gherkin_steps(gherkin: str) -> List[str]:
     return steps
 
 def get_client(api_key: str):
+    # Timeout de 120s para evitar erro 504
     return openai.OpenAI(api_key=api_key, base_url="https://openrouter.ai/api/v1", http_client=httpx.Client(timeout=120.0))
 
 def extract_frames_from_video(video_bytes: bytes, num_frames: int = 3) -> List[bytes]:
@@ -80,22 +79,23 @@ def extract_frames_from_video(video_bytes: bytes, num_frames: int = 3) -> List[b
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 pil_img = PILImage.fromarray(frame_rgb)
                 buffer = io.BytesIO()
-                pil_img.save(buffer, format="JPEG", quality=70) # Compressão para nuvem
+                # Otimização de qualidade para reduzir payload
+                pil_img.save(buffer, format="JPEG", quality=70)
                 frames.append(buffer.getvalue())
     cap.release()
     os.unlink(tmp_path)
     return frames
 
-# --- CORE DE ANÁLISE IA (BATCHING + JSON FIX) ---
+# --- Core de Análise (Otimizado para evitar 504 e 429) ---
 
 def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], api_key: str) -> Dict[str, Any]:
     client = get_client(api_key)
     steps = split_gherkin_steps(gherkin)
 
-    processed_evidence = []
     images_payload = []
+    processed_evidence = []
 
-    # Processamento de Imagens Otimizado
+    # 1. Processamento e Otimização de Imagens
     for f in files:
         file_bytes_list = []
         if f['type'].startswith('image/'):
@@ -107,20 +107,21 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
             try:
                 img = PILImage.open(io.BytesIO(b))
                 if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                img.thumbnail((800, 800))
+                img.thumbnail((800, 800)) # Redução de resolução para evitar timeout
                 buffered = io.BytesIO()
-                img.save(buffered, format="JPEG", quality=70)
+                img.save(buffered, format="JPEG", quality=70) # Compressão
                 final_bytes = buffered.getvalue()
                 processed_evidence.append(final_bytes)
                 b64 = base64.b64encode(final_bytes).decode('utf-8')
                 images_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
             except: continue
 
-    # Prompt Único para o Cenário Inteiro
-    passos_txt = "\n".join([f"- {s}" for s in steps])
+    # 2. Chamada em Lote (Batching) - Analisa todos os passos em uma única requisição
+    steps_list_str = "\n".join([f"{i+1}. {s}" for i, s in enumerate(steps)])
     prompt_texto = (
-        f"Analise estes passos Gherkin:\n{passos_txt}\n\n"
-        "Com base nas evidências, retorne EXCLUSIVAMENTE um JSON: "
+        f"Cenário: {name}\n"
+        f"Analise os seguintes passos de teste e verifique as evidências visuais enviadas:\n{steps_list_str}\n\n"
+        "Retorne EXCLUSIVAMENTE um objeto JSON no seguinte formato, sem explicações:\n"
         "{\"analises\": [{\"status\": \"PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA\", \"justificativa\": \"...\"}]}"
     )
 
@@ -131,28 +132,29 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
         response = client.chat.completions.create(
             model="google/gemini-2.0-flash-001",
             messages=[
-                {"role": "system", "content": "Você é um auditor de QA. Responda apenas em JSON estrito."},
+                {"role": "system", "content": "Você é um auditor de QA. Responda apenas com JSON válido."},
                 {"role": "user", "content": content}
             ],
             response_format={"type": "json_object"},
             timeout=100.0
         )
 
-        # Limpeza de resposta para evitar erros de aspas/formatação
-        res_raw = response.choices[0].message.content.strip()
-        if "```json" in res_raw:
-            res_raw = res_raw.split("```json")[-1].split("```")[0].strip()
+        # Limpeza de resposta (JSON Fix)
+        raw_content = response.choices[0].message.content.strip()
+        if "```json" in raw_content:
+            raw_content = raw_content.split("```json")[-1].split("```")[0].strip()
 
-        parsed = json.loads(res_raw)
-        ai_list = parsed.get('analises', [])
+        parsed = json.loads(raw_content)
+        ai_analises = parsed.get('analises', [])
 
         step_analyses = []
         for i, step in enumerate(steps):
-            data = ai_list[i] if i < len(ai_list) else {"status": "ERRO", "justificativa": "Não processado."}
+            # Garante que mapeia o resultado correto para cada passo
+            data = ai_analises[i] if i < len(ai_analises) else {"status": "ERRO", "justificativa": "Não analisado pela IA"}
             step_analyses.append({'step': step, **data})
 
     except Exception as e:
-        step_analyses = [{'step': s, 'status': 'ERRO', 'justificativa': str(e)} for s in steps]
+        step_analyses = [{'step': s, 'status': 'ERRO', 'justificativa': f"Falha: {str(e)}"} for s in steps]
 
     pass_count = sum(1 for s in step_analyses if s['status'] in ["PASSOU", "EVIDÊNCIA NÃO DISPONIBILIZADA"])
     return {
@@ -164,20 +166,16 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
 def generate_business_summary(results: List[Dict], metadata: Dict, api_key: str) -> str:
     client = get_client(api_key)
     jira_context = metadata.get('jira_full_text', 'Não informado')
+    resumo_executivo = "\n".join([f"- {r['name']}: {r['pass_count']}/{r['total_steps']} passsou." for r in results])
 
-    contexto_testes = f"Teste: {metadata.get('teste_nome')}\n"
-    for res in results:
-        contexto_testes += f"Cenário: {res['name']} - Status: {res['pass_count']}/{res['total_steps']} validados.\n"
-
-    prompt = f"Atue como PO. Resuma em 1 parágrafo se os testes condizem com os requisitos:\n\nREQ: {jira_context}\n\nRES: {contexto_testes}"
-
+    prompt = f"Como PO, escreva um resumo de negócio de 1 parágrafo focado no valor e conformidade técnica.\n\nREQ: {jira_context}\n\nRESULTADOS: {resumo_executivo}"
     try:
         response = client.chat.completions.create(model="google/gemini-2.0-flash-001", messages=[{"role": "user", "content": prompt}])
         return response.choices[0].message.content
     except:
-        return "Resumo gerado automaticamente com base na execução técnica."
+        return "Resumo gerado com base nos critérios de aceite e evidências técnicas."
 
-# --- GERAÇÃO DE PDF ---
+# --- PDF e Interface ---
 
 def add_footer(canvas, doc):
     canvas.saveState()
@@ -198,26 +196,24 @@ def generate_pdf(results: List[Dict], metadata: Dict, business_summary: str, log
     section_style = ParagraphStyle('T2', parent=styles['Heading2'], fontSize=12, textColor=PRIMARY_BLUE, spaceBefore=12)
     meta_style = ParagraphStyle('Meta', parent=styles['Normal'], fontSize=9, leading=11)
 
-    # Cabeçalho com Logo
     if logo_bytes:
         img_io = io.BytesIO(logo_bytes)
         logo_img = RLImage(img_io, width=40*mm, height=15*mm)
         story.append(Table([[logo_img, Paragraph("AUDITORIA DE QUALIDADE", title_style)]], colWidths=[45*mm, 135*mm]))
-    else:
-        story.append(Paragraph("AUDITORIA DE QUALIDADE", title_style))
+    else: story.append(Paragraph("AUDITORIA DE QUALIDADE", title_style))
 
     story.append(Paragraph(f"<font size=10 color=gray>{metadata.get('teste_nome', '').upper()}</font>", styles['Normal']))
     story.append(Spacer(1, 10))
 
-    # Tabela de Metadados (TODOS OS CAMPOS)
+    # Tabela de Metadados (TODOS OS CAMPOS RESTAURADOS)
     meta_data = [
         [Paragraph(f"<b>MÓDULO:</b> {metadata.get('modulo', '')}", meta_style), Paragraph(f"<b>SPRINT:</b> {metadata.get('sprint', '')}", meta_style)],
         [Paragraph(f"<b>STATUS:</b> {metadata.get('status', '')}", meta_style), Paragraph(f"<b>VERSÃO:</b> {metadata.get('versao', '')}", meta_style)],
         [Paragraph(f"<b>HISTÓRIA:</b> {metadata.get('historia', '')}", meta_style), Paragraph(f"<b>AUTOMATIZADO:</b> {metadata.get('automatizado', '')}", meta_style)],
-        [Paragraph(f"<b>PRÉ-REQUISITOS:</b> {metadata.get('pre_requisitos', '')}", meta_style), Paragraph(f"<b>Qtd. CT:</b> {len(results)}", meta_style)]
+        [Paragraph(f"<b>PRÉ REQUISITOS:</b> {metadata.get('pre_requisitos', '')}", meta_style), Paragraph(f"<b>Qtd. CT:</b> {len(results)}", meta_style)]
     ]
     meta_table = Table(meta_data, colWidths=[90*mm, 90*mm])
-    meta_table.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, BORDER_GRAY), ('VALIGN', (0,0), (-1,-1), 'TOP'), ('PADDING', (0,0), (-1,-1), 5)]))
+    meta_table.setStyle(TableStyle([('GRID', (0,0), (-1,-1), 0.5, BORDER_GRAY), ('VALIGN', (0,0), (-1,-1), 'TOP'), ('BOTTOMPADDING', (0,0), (-1,-1), 5)]))
     story.append(meta_table)
 
     story.append(Paragraph("RESUMO EXECUTIVO (NEGÓCIO)", section_style))
@@ -229,26 +225,23 @@ def generate_pdf(results: List[Dict], metadata: Dict, business_summary: str, log
         for s in res['steps']:
             color = PASS_GREEN if "PASSOU" in str(s['status']) else (WARN_ORANGE if "DISPONIBILIZADA" in str(s['status']) else FAIL_RED)
             steps_data.append([Paragraph(s['step'], meta_style), Paragraph(f"<b><font color={color}>{s['status']}</font></b>", meta_style), Paragraph(s['justificativa'], meta_style)])
-
         t = Table(steps_data, colWidths=[65*mm, 40*mm, 75*mm])
         t.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), PRIMARY_BLUE), ('TEXTCOLOR', (0,0), (-1,0), colors.white), ('GRID', (0,0), (-1,-1), 0.5, colors.white), ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, LIGHT_GRAY]), ('VALIGN', (0,0), (-1,-1), 'TOP')]))
         story.append(t)
-
         for img_bytes in res.get('evidence_images', []):
             story.append(KeepTogether([Spacer(1, 8), RLImage(io.BytesIO(img_bytes), width=160*mm, height=90*mm)]))
 
     doc.build(story, onFirstPage=add_footer, onLaterPages=add_footer)
     return buffer.getvalue()
 
-# --- INTERFACE ---
+# --- Streamlit UI ---
 
 st.sidebar.title("🛠️ Configurações")
 api_key = st.sidebar.text_input("OpenRouter API Key", type="password")
-logo_upload = st.sidebar.file_uploader("🖼️ Upload do Logo", type=["png", "jpg", "jpeg"])
+logo_upload = st.sidebar.file_uploader("Upload do Logo", type=["png", "jpg"])
 
 st.title("🧪 Auditoria de Qualidade Pro")
 
-# RESTAURADO: Expander com todos os campos originais
 with st.expander("📝 Cabeçalho do Documento", expanded=True):
     c1, c2 = st.columns(2)
     st.session_state.metadata['teste_nome'] = c1.text_input("TESTE (Título)")
@@ -261,39 +254,39 @@ with st.expander("📝 Cabeçalho do Documento", expanded=True):
     st.session_state.metadata['automatizado'] = c2.radio("AUTOMATIZADO", ["Não", "Sim"], horizontal=True)
 
 with st.container(border=True):
-    st.subheader("📖 Detalhamento da História / Requisitos")
-    modo_jira = st.radio("Entrada:", ["Escrever Descrição (Jira)", "Anexar Documento"], horizontal=True)
-    if modo_jira == "Escrever Descrição (Jira)":
-        st.session_state.metadata['jira_full_text'] = st.text_area("Critérios de Aceitação:", height=150)
+    st.subheader("📖 Requisitos da História")
+    modo = st.radio("Entrada:", ["Texto Manual", "Upload PDF/TXT"], horizontal=True)
+    if modo == "Texto Manual":
+        st.session_state.metadata['jira_full_text'] = st.text_area("Critérios de Aceite:", height=150)
     else:
-        jira_file = st.file_uploader("Upload Requisitos", type=["pdf", "txt"])
-        if jira_file: st.session_state.metadata['jira_full_text'] = extrair_texto_arquivo(jira_file)
+        req_file = st.file_uploader("Arquivo de Requisitos", type=["pdf", "txt"])
+        if req_file: st.session_state.metadata['jira_full_text'] = extrair_texto_arquivo(req_file)
 
-st.header("📋 Cenários de Teste")
+st.header("📋 Cenários")
 if st.button("➕ Adicionar CT"):
     st.session_state.ct_list.append({"id": f"CT{len(st.session_state.ct_list)+1:02d}", "name": "", "gherkin": "", "up_files": []})
 
 for i, ct in enumerate(st.session_state.ct_list):
     with st.container(border=True):
-        col_id, col_name = st.columns([1, 4])
-        ct['id'] = col_id.text_input("ID", value=ct['id'], key=f"id_{i}")
-        ct['name'] = col_name.text_input("Nome do Cenário", value=ct['name'], key=f"name_{i}")
+        c_id, c_name = st.columns([1, 4])
+        ct['id'] = c_id.text_input("ID", value=ct['id'], key=f"id_{i}")
+        ct['name'] = c_name.text_input("Nome", value=ct['name'], key=f"name_{i}")
         ct['gherkin'] = st.text_area("Gherkin", value=ct['gherkin'], key=f"gh_{i}")
-        ct['up_files'] = st.file_uploader(f"Evidências {ct['id']}", accept_multiple_files=True, key=f"f_{i}", type=["png", "jpg", "jpeg", "mp4", "mov", "avi"])
+        ct['up_files'] = st.file_uploader(f"Evidências {ct['id']}", accept_multiple_files=True, key=f"f_{i}")
 
 if st.button("🚀 Gerar Auditoria Completa", type="primary"):
-    if not api_key: st.error("Insira a API Key.")
-    elif not st.session_state.ct_list: st.warning("Adicione pelo menos um cenário.")
+    if not api_key: st.error("Falta API Key.")
+    elif not st.session_state.ct_list: st.warning("Adicione um cenário.")
     else:
-        with st.spinner("IA Analisando..."):
+        with st.spinner("IA Analisando (esta etapa pode demorar devido ao tamanho das evidências)..."):
             results = []
             for ct in st.session_state.ct_list:
-                files = [{"name": f.name, "bytes": f.getvalue(), "type": f.type} for f in ct['up_files']] if ct['up_files'] else []
+                files = [{"name": f.name, "bytes": f.getvalue(), "type": f.type} for f in ct['up_files']]
                 results.append(analyze_ct_with_ai(ct['id'], ct['name'], ct['gherkin'], files, api_key))
 
             summary = generate_business_summary(results, st.session_state.metadata, api_key)
             logo_data = logo_upload.getvalue() if logo_upload else None
 
             pdf = generate_pdf(results, st.session_state.metadata, summary, logo_data)
-            st.success("Auditoria Concluída!")
-            st.download_button("📥 Baixar PDF Premium", data=pdf, file_name="auditoria_qa.pdf", mime="application/pdf")
+            st.success("Concluído!")
+            st.download_button("📥 Baixar PDF Auditoria", data=pdf, file_name="auditoria_gic.pdf", mime="application/pdf")
