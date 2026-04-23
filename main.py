@@ -139,8 +139,9 @@ def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], a
             response = client.chat.completions.create(model="google/gemini-2.0-flash-001", messages=[{"role": "user", "content": content}], response_format={"type": "json_object"}, timeout=60.0)
             parsed = json.loads(response.choices[0].message.content)
             step_analyses.append({'step': step, 'status': parsed.get('status'), 'justificativa': parsed.get('justificativa')})
-        except:
-            step_analyses.append({'step': step, 'status': 'ERRO', 'justificativa': 'Falha na comunicação com a IA.'})
+        except Exception as e:
+            st.error(f"Erro detalhado: {e}") # Isso vai mostrar o erro na tela do Streamlit
+            step_analyses.append({'step': step, 'status': 'ERRO', 'justificativa': f'Erro: {e}'})
     pass_count = sum(1 for s in step_analyses if s['status'] in ["PASSOU", "EVIDÊNCIA NÃO DISPONIBILIZADA"])
     return {'ct_id': ct_id, 'name': name, 'steps': step_analyses, 'pass_count': pass_count, 'total_steps': len(steps), 'evidence_images': processed_evidence}
 
