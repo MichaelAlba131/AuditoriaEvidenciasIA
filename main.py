@@ -111,37 +111,62 @@ def generate_business_summary(results: List[Dict], metadata: Dict, api_key: str)
 def analyze_ct_with_ai(ct_id: str, name: str, gherkin: str, files: List[Dict], api_key: str) -> Dict[str, Any]:
     client = get_client(api_key)
     steps = split_gherkin_steps(gherkin)
-    step_analyses = []
+
     images_payload = []
     processed_evidence = []
+
+    # 1. Processamento de Imagens (Reduzi a qualidade para evitar 504)
     for f in files:
         file_bytes_list = []
         if f['type'].startswith('image/'):
             file_bytes_list = [f['bytes']]
         elif f['type'].startswith('video/'):
-            file_bytes_list = extract_frames_from_video(f['bytes'])
+            file_bytes_list = extract_frames_from_video(f['bytes'], num_frames=3) # Reduzi para 3 frames
+
         for b in file_bytes_list:
             try:
                 img = PILImage.open(io.BytesIO(b))
                 if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                img.thumbnail((1024, 1024))
+                img.thumbnail((800, 800)) # Reduzi de 1024 para 800
                 buffered = io.BytesIO()
-                img.save(buffered, format="JPEG", quality=85)
+                img.save(buffered, format="JPEG", quality=70) # Qualidade 70 economiza muito payload
                 final_bytes = buffered.getvalue()
                 processed_evidence.append(final_bytes)
                 b64 = base64.b64encode(final_bytes).decode('utf-8')
                 images_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
             except: continue
-    for step in steps:
-        content = [{"type": "text", "text": f"Analise o passo: \"{step}\". Retorne JSON: {{\"status\": \"PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA\", \"justificativa\": \"...\"}}"}]
-        content.extend(images_payload)
-        try:
-            response = client.chat.completions.create(model="google/gemini-2.0-flash-001", messages=[{"role": "user", "content": content}], response_format={"type": "json_object"}, timeout=60.0)
-            parsed = json.loads(response.choices[0].message.content)
-            step_analyses.append({'step': step, 'status': parsed.get('status'), 'justificativa': parsed.get('justificativa')})
-        except Exception as e:
-            st.error(f"Erro detalhado: {e}") # Isso vai mostrar o erro na tela do Streamlit
-            step_analyses.append({'step': step, 'status': 'ERRO', 'justificativa': f'Erro: {e}'})
+
+    # 2. Chamada ÚNICA para todos os passos (Batching)
+    prompt_texto = f"Analise os seguintes passos do cenário de teste: {', '.join(steps)}. " \
+                   f"Para cada passo, verifique se as imagens comprovam a execução. " \
+                   f"Retorne um JSON com uma lista de objetos 'analises' contendo: " \
+                   f"{{'status': 'PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA', 'justificativa': '...'}}"
+
+    content = [{"type": "text", "text": prompt_texto}]
+    content.extend(images_payload)
+
+    try:
+        # Note que a chamada agora está FORA do loop de steps
+        response = client.chat.completions.create(
+            model="google/gemini-2.0-flash-001",
+            messages=[{"role": "user", "content": content}],
+            response_format={"type": "json_object"},
+            timeout=90.0 # Aumentei o timeout para dar fôlego à IA
+        )
+        raw_result = json.loads(response.choices[0].message.content)
+        # Mapeia a resposta da IA de volta para os steps
+        step_analyses = []
+        # Garantir que temos uma resposta para cada step, mesmo se a IA pular algum
+        ai_steps = raw_result.get('analises', [])
+        for i, step in enumerate(steps):
+            if i < len(ai_steps):
+                step_analyses.append({'step': step, **ai_steps[i]})
+            else:
+                step_analyses.append({'step': step, 'status': 'ERRO', 'justificativa': 'IA não processou este passo.'})
+
+    except Exception as e:
+        return {'ct_id': ct_id, 'name': name, 'steps': [{'step': s, 'status': 'ERRO', 'justificativa': str(e)} for s in steps], 'pass_count': 0, 'total_steps': len(steps), 'evidence_images': processed_evidence}
+
     pass_count = sum(1 for s in step_analyses if s['status'] in ["PASSOU", "EVIDÊNCIA NÃO DISPONIBILIZADA"])
     return {'ct_id': ct_id, 'name': name, 'steps': step_analyses, 'pass_count': pass_count, 'total_steps': len(steps), 'evidence_images': processed_evidence}
 
