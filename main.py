@@ -83,41 +83,37 @@ def analyze_all_cts_at_once(ct_list: List[Dict], api_key: str) -> List[Dict]:
         scenarios_context = f"--- ID: {ct['id']} | NOME: {ct['name']} ---\nPASSOS:\n{ct['gherkin']}\n"
         images_payload = []
 
-        # 1. Preparar as evidências apenas deste cenário
         for f in ct.get('up_files', []):
             try:
-                file_bytes_list = extract_frames_from_video(f.getvalue()) if f.type.startswith('video/') else [f.getvalue()]
+                # MODO EXTREMO DE POUPANÇA: Apenas 3 frames por vídeo
+                file_bytes_list = extract_frames_from_video(f.getvalue(), num_frames=3) if f.type.startswith('video/') else [f.getvalue()]
 
                 for b in file_bytes_list:
                     img = PILImage.open(io.BytesIO(b))
                     if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                    # Aumentamos a resolução para 1280 para a IA ver melhor os botões
-                    img.thumbnail((1280, 1280))
+
+                    # Redução drástica de resolução e qualidade para evitar o 429
+                    img.thumbnail((768, 768))
                     buffered = io.BytesIO()
-                    img.save(buffered, format="JPEG", quality=85)
+                    img.save(buffered, format="JPEG", quality=60)
                     b64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
                     images_payload.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
             except Exception as e:
                 print(f"Erro ao processar imagem para IA: {e}")
                 continue
 
-        # 2. Prompt focado (Reforçado para obrigar a IA a olhar para as imagens)
-        prompt = f"""Atue como um Especialista em QA. Analise o Cenário de Teste abaixo contra as evidências visuais enviadas em anexo.
+        prompt = f"""Atue como um QA. Analise o Cenário abaixo contra as evidências (imagens em anexo).
 
-        CENÁRIO PARA ANÁLISE:
+        CENÁRIO:
         {scenarios_context}
 
-        DICAS IMPORTANTES:
-        1. AS IMAGENS ENVIADAS JUNTO COM ESTE PROMPT SÃO AS EVIDÊNCIAS. Você DEVE analisar cada uma delas com atenção.
-        2. Para validar ações (como clicar num botão ou abrir um painel), compare o estado da interface entre as diferentes imagens fornecidas.
-        3. Apenas retorne "EVIDÊNCIA NÃO DISPONIBILIZADA" se a imagem em anexo não tiver absolutamente nenhuma relação com o passo do teste.
-
-        REQUISITOS DE SAÍDA:
-        Retorne APENAS um JSON no seguinte formato:
+        REQUISITOS:
+        1. Compare as imagens em anexo para validar os passos.
+        2. Retorne APENAS o JSON:
         {{
           "ct_id": "{ct['id']}",
           "steps_analysis": [
-            {{"step": "Texto do passo", "status": "PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA", "justificativa": "Sua análise visual aqui detalhando o que viu na imagem."}}
+            {{"step": "Passo", "status": "PASSOU/FALHOU/EVIDÊNCIA NÃO DISPONIBILIZADA", "justificativa": "Análise visual detalhada."}}
           ]
         }}"""
 
@@ -147,17 +143,18 @@ def analyze_all_cts_at_once(ct_list: List[Dict], api_key: str) -> List[Dict]:
             except Exception as e:
                 error_str = str(e)
                 if any(code in error_str for code in ["429", "504", "502"]) and attempt < max_retries - 1:
-                    wait_time = (attempt + 1) * 10
-                    st.warning(f"Instabilidade na API ({ct['id']}). Tentativa {attempt+1}/{max_retries}. Aguardando {wait_time}s...")
+                    # Esperas muito mais longas: 30s, 60s, 90s
+                    wait_time = (attempt + 1) * 30
+                    st.warning(f"O Provedor da IA bloqueou por excesso de carga. Tentativa {attempt+1}/{max_retries} em {wait_time}s...")
                     time.sleep(wait_time)
                 else:
-                    st.error(f"Erro crítico ao analisar o {ct['id']}: {e}")
+                    st.error(f"Erro ao analisar o {ct['id']}:\n{error_str}")
                     break
 
         if not success:
             all_results.append({
                 "ct_id": ct['id'],
-                "steps_analysis": [{"step": "Geral", "status": "ERRO", "justificativa": "Falha de comunicação com a IA após múltiplas tentativas."}]
+                "steps_analysis": [{"step": "Geral", "status": "ERRO", "justificativa": "O servidor da IA rejeitou a análise por limites técnicos de processamento."}]
             })
 
     return all_results
